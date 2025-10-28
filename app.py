@@ -32,6 +32,11 @@ def load_data():
     try:
         supabase = init_supabase()
         response = supabase.table('airquality').select('*').execute()
+        
+        if not response.data:
+            st.error("No data found in the database.")
+            return pd.DataFrame()
+            
         df = pd.DataFrame(response.data)
         
         # Convert columns to appropriate data types
@@ -51,7 +56,7 @@ def load_data():
         st.error(f"Error loading data: {e}")
         return pd.DataFrame()
 
-def create_features(df, target_columns, n_lags=6):
+def create_features(df, target_columns, n_lags=3):
     """Create lag features for time series prediction"""
     df_eng = df.copy()
     
@@ -87,7 +92,7 @@ def train_random_forest(X_train, X_test, y_train, y_test, target_columns):
     scores = {}
     
     for i, col in enumerate(target_columns):
-        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+        rf = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
         rf.fit(X_train, y_train[:, i])
         pred = rf.predict(X_test)
         
@@ -108,7 +113,7 @@ def train_xgboost(X_train, X_test, y_train, y_test, target_columns):
     
     for i, col in enumerate(target_columns):
         xgb_model = xgb.XGBRegressor(
-            n_estimators=100,
+            n_estimators=50,
             learning_rate=0.1,
             random_state=42,
             n_jobs=-1
@@ -168,11 +173,11 @@ def train_lstm(X_train, X_test, y_train, y_test, target_columns):
     
     # Build LSTM model
     model = Sequential([
-        LSTM(50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+        LSTM(32, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
         Dropout(0.2),
-        LSTM(50, return_sequences=False),
+        LSTM(32, return_sequences=False),
         Dropout(0.2),
-        Dense(25),
+        Dense(16),
         Dense(len(target_columns))
     ])
     
@@ -181,8 +186,8 @@ def train_lstm(X_train, X_test, y_train, y_test, target_columns):
     # Train model
     history = model.fit(
         X_train_scaled, y_train_scaled,
-        epochs=50,
-        batch_size=32,
+        epochs=30,
+        batch_size=16,
         validation_split=0.2,
         verbose=0
     )
@@ -213,7 +218,7 @@ def main():
         df = load_data()
     
     if df.empty:
-        st.error("No data loaded. Please check your Supabase connection.")
+        st.error("No data loaded. Please check your Supabase connection and ensure the 'airquality' table exists.")
         return
     
     st.sidebar.header("Configuration")
@@ -226,12 +231,20 @@ def main():
         default=target_columns
     )
     
+    if not selected_targets:
+        st.warning("Please select at least one target variable to predict.")
+        return
+    
     # Model selection
     models_to_train = st.sidebar.multiselect(
         "Select models to train:",
         ['Random Forest', 'XGBoost', 'SVM', 'LSTM'],
         default=['Random Forest', 'XGBoost']
     )
+    
+    if not models_to_train:
+        st.warning("Please select at least one model to train.")
+        return
     
     # Display data overview
     st.header("📊 Data Overview")
@@ -246,23 +259,48 @@ def main():
         st.metric("Target Variables", len(selected_targets))
     
     with col3:
-        st.metric("Data Completeness", f"{(1 - df[target_columns].isna().sum().sum() / (len(df) * len(target_columns))) * 100:.1f}%")
+        completeness = (1 - df[target_columns].isna().sum().sum() / (len(df) * len(target_columns))) * 100
+        st.metric("Data Completeness", f"{completeness:.1f}%")
     
     # Show data preview
     if st.checkbox("Show raw data"):
         st.dataframe(df.tail(10))
     
+    # Show data statistics
+    if st.checkbox("Show data statistics"):
+        st.subheader("Data Statistics")
+        st.dataframe(df[target_columns].describe())
+    
     # Feature engineering
     st.header("🔧 Feature Engineering")
-    df_eng = create_features(df, selected_targets)
+    
+    if len(df) < 10:
+        st.error("Not enough data for feature engineering. Need at least 10 records.")
+        return
+        
+    df_eng = create_features(df, selected_targets, n_lags=2)
+    
+    if len(df_eng) == 0:
+        st.error("No data available after feature engineering. Check your data quality.")
+        return
     
     # Prepare data for traditional ML models
     feature_cols = [col for col in df_eng.columns if col not in ['id', 'created_at'] + selected_targets]
+    
+    if not feature_cols:
+        st.error("No features generated. Check your data.")
+        return
+        
     X = df_eng[feature_cols].values
     y = df_eng[selected_targets].values
     
     # Split data
     test_size = st.sidebar.slider("Test set size:", 0.1, 0.3, 0.2)
+    
+    if len(X) < 10:
+        st.error("Not enough data for training. Need at least 10 samples after feature engineering.")
+        return
+        
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, shuffle=False)
     
     # Model training section
@@ -272,161 +310,164 @@ def main():
     all_predictions = {}
     all_scores = {}
     
+    # Model name to key mapping
+    model_keys = {
+        'Random Forest': 'RF',
+        'XGBoost': 'XGB', 
+        'SVM': 'SVM',
+        'LSTM': 'LSTM'
+    }
+    
     # Train selected models
     for model_name in models_to_train:
         st.subheader(f"{model_name} Model")
+        model_key = model_keys[model_name]
         
-        with st.spinner(f'Training {model_name}...'):
-            if model_name == 'Random Forest':
-                models, predictions, scores = train_random_forest(X_train, X_test, y_train, y_test, selected_targets)
-                all_models['RF'] = models
-                all_predictions['RF'] = predictions
-                all_scores['RF'] = scores
+        try:
+            with st.spinner(f'Training {model_name}...'):
+                if model_name == 'Random Forest':
+                    models, predictions, scores = train_random_forest(X_train, X_test, y_train, y_test, selected_targets)
+                    all_models[model_key] = models
+                    all_predictions[model_key] = predictions
+                    all_scores[model_key] = scores
+                    
+                elif model_name == 'XGBoost':
+                    models, predictions, scores = train_xgboost(X_train, X_test, y_train, y_test, selected_targets)
+                    all_models[model_key] = models
+                    all_predictions[model_key] = predictions
+                    all_scores[model_key] = scores
+                    
+                elif model_name == 'SVM':
+                    model, predictions, scores, scaler_X, scaler_y = train_svm(X_train, X_test, y_train, y_test, selected_targets)
+                    all_models[model_key] = (model, scaler_X, scaler_y)
+                    all_predictions[model_key] = {col: predictions[:, i] for i, col in enumerate(selected_targets)}
+                    all_scores[model_key] = scores
+                    
+                elif model_name == 'LSTM':
+                    # Prepare LSTM data
+                    sequence_length = min(5, len(df_eng) // 3)  # Adaptive sequence length
+                    if sequence_length < 2:
+                        st.warning("Not enough data for LSTM. Skipping LSTM training.")
+                        continue
+                        
+                    X_lstm, y_lstm = prepare_lstm_data(df_eng, selected_targets, sequence_length)
+                    
+                    if len(X_lstm) == 0:
+                        st.warning("Not enough sequences for LSTM training. Skipping LSTM.")
+                        continue
+                    
+                    # Split LSTM data
+                    split_idx = int(len(X_lstm) * (1 - test_size))
+                    X_train_lstm, X_test_lstm = X_lstm[:split_idx], X_lstm[split_idx:]
+                    y_train_lstm, y_test_lstm = y_lstm[:split_idx], y_lstm[split_idx:]
+                    
+                    model, predictions, scores, history, scaler_X, scaler_y = train_lstm(
+                        X_train_lstm, X_test_lstm, y_train_lstm, y_test_lstm, selected_targets
+                    )
+                    all_models[model_key] = (model, scaler_X, scaler_y)
+                    all_predictions[model_key] = {col: predictions[:, i] for i, col in enumerate(selected_targets)}
+                    all_scores[model_key] = scores
+            
+            # Display scores for this model
+            if model_key in all_scores:
+                scores_df = pd.DataFrame(all_scores[model_key]).T
+                scores_df.columns = ['RMSE', 'R² Score']
+                st.dataframe(scores_df.style.format({"RMSE": "{:.4f}", "R² Score": "{:.4f}"}))
                 
-            elif model_name == 'XGBoost':
-                models, predictions, scores = train_xgboost(X_train, X_test, y_train, y_test, selected_targets)
-                all_models['XGB'] = models
-                all_predictions['XGB'] = predictions
-                all_scores['XGB'] = scores
-                
-            elif model_name == 'SVM':
-                model, predictions, scores, scaler_X, scaler_y = train_svm(X_train, X_test, y_train, y_test, selected_targets)
-                all_models['SVM'] = (model, scaler_X, scaler_y)
-                all_predictions['SVM'] = predictions
-                all_scores['SVM'] = scores
-                
-            elif model_name == 'LSTM':
-                # Prepare LSTM data
-                sequence_length = 10
-                X_lstm, y_lstm = prepare_lstm_data(df_eng, selected_targets, sequence_length)
-                
-                # Split LSTM data
-                split_idx = int(len(X_lstm) * (1 - test_size))
-                X_train_lstm, X_test_lstm = X_lstm[:split_idx], X_lstm[split_idx:]
-                y_train_lstm, y_test_lstm = y_lstm[:split_idx], y_lstm[split_idx:]
-                
-                model, predictions, scores, history, scaler_X, scaler_y = train_lstm(
-                    X_train_lstm, X_test_lstm, y_train_lstm, y_test_lstm, selected_targets
-                )
-                all_models['LSTM'] = (model, scaler_X, scaler_y)
-                all_predictions['LSTM'] = predictions
-                all_scores['LSTM'] = scores
-        
-        # Display scores for this model
-        scores_df = pd.DataFrame(all_scores[model_name[:3]]).T
-        scores_df.columns = ['RMSE', 'R² Score']
-        st.dataframe(scores_df.style.format({"RMSE": "{:.4f}", "R² Score": "{:.4f}"}))
+        except Exception as e:
+            st.error(f"Error training {model_name}: {str(e)}")
+            continue
     
     # Model comparison
-    if len(models_to_train) > 1:
+    if len(all_scores) > 1:
         st.header("📈 Model Comparison")
         
         # Create comparison chart
         comparison_data = []
-        for model_key in all_scores.keys():
+        for model_key, scores_dict in all_scores.items():
             for target in selected_targets:
-                comparison_data.append({
-                    'Model': model_key,
-                    'Target': target,
-                    'RMSE': all_scores[model_key][target]['rmse'],
-                    'R2_Score': all_scores[model_key][target]['r2']
-                })
+                if target in scores_dict:
+                    comparison_data.append({
+                        'Model': model_key,
+                        'Target': target,
+                        'RMSE': scores_dict[target]['rmse'],
+                        'R2_Score': scores_dict[target]['r2']
+                    })
         
-        comparison_df = pd.DataFrame(comparison_data)
-        
-        # RMSE comparison
-        fig_rmse = go.Figure()
-        for model in comparison_df['Model'].unique():
-            model_data = comparison_df[comparison_df['Model'] == model]
-            fig_rmse.add_trace(go.Bar(
-                name=model,
-                x=model_data['Target'],
-                y=model_data['RMSE']
-            ))
-        
-        fig_rmse.update_layout(
-            title="RMSE Comparison by Model and Target",
-            xaxis_title="Target Variable",
-            yaxis_title="RMSE",
-            barmode='group'
-        )
-        
-        st.plotly_chart(fig_rmse, use_container_width=True)
+        if comparison_data:
+            comparison_df = pd.DataFrame(comparison_data)
+            
+            # RMSE comparison
+            fig_rmse = go.Figure()
+            for model in comparison_df['Model'].unique():
+                model_data = comparison_df[comparison_df['Model'] == model]
+                fig_rmse.add_trace(go.Bar(
+                    name=model,
+                    x=model_data['Target'],
+                    y=model_data['RMSE']
+                ))
+            
+            fig_rmse.update_layout(
+                title="RMSE Comparison by Model and Target",
+                xaxis_title="Target Variable",
+                yaxis_title="RMSE",
+                barmode='group'
+            )
+            
+            st.plotly_chart(fig_rmse, use_container_width=True)
     
     # Future prediction
     st.header("🔮 Future Prediction")
     
-    if st.button("Predict Next Values"):
-        # Use the most recent data to predict next values
-        latest_features = df_eng[feature_cols].iloc[-1:].values
-        
-        st.subheader("Predicted Next Values:")
-        
-        predictions_data = []
-        for model_key in all_models.keys():
-            if model_key in ['RF', 'XGB']:
+    if st.button("Predict Next Values") and all_models:
+        try:
+            # Use the most recent data to predict next values
+            latest_features = df_eng[feature_cols].iloc[-1:].values
+            
+            st.subheader("Predicted Next Values:")
+            
+            predictions_data = []
+            model_names = []
+            
+            for model_key in all_models.keys():
                 model_preds = {}
-                for target in selected_targets:
-                    model_preds[target] = all_models[model_key][target].predict(latest_features)[0]
-                predictions_data.append(model_preds)
                 
-            elif model_key == 'SVM':
-                model, scaler_X, scaler_y = all_models['SVM']
-                latest_scaled = scaler_X.transform(latest_features)
-                pred_scaled = model.predict(latest_scaled)
-                pred = scaler_y.inverse_transform(pred_scaled)[0]
-                model_preds = {target: pred[i] for i, target in enumerate(selected_targets)}
-                predictions_data.append(model_preds)
+                if model_key in ['RF', 'XGB']:
+                    for target in selected_targets:
+                        if target in all_models[model_key]:
+                            model_preds[target] = all_models[model_key][target].predict(latest_features)[0]
+                        else:
+                            model_preds[target] = np.nan
+                    
+                elif model_key == 'SVM':
+                    model, scaler_X, scaler_y = all_models['SVM']
+                    latest_scaled = scaler_X.transform(latest_features)
+                    pred_scaled = model.predict(latest_scaled)
+                    pred = scaler_y.inverse_transform(pred_scaled)[0]
+                    for i, target in enumerate(selected_targets):
+                        model_preds[target] = pred[i]
+                        
+                elif model_key == 'LSTM':
+                    model, scaler_X, scaler_y = all_models['LSTM']
+                    # Use last sequence for prediction
+                    sequence_length = model.input_shape[1]
+                    sequence_data = df_eng[['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']].tail(sequence_length).values
+                    sequence_scaled = scaler_X.transform(sequence_data.reshape(-1, 6)).reshape(1, sequence_length, 6)
+                    pred_scaled = model.predict(sequence_scaled, verbose=0)
+                    pred = scaler_y.inverse_transform(pred_scaled)[0]
+                    for i, target in enumerate(selected_targets):
+                        model_preds[target] = pred[i]
                 
-            elif model_key == 'LSTM':
-                model, scaler_X, scaler_y = all_models['LSTM']
-                # Use last sequence for prediction
-                sequence_data = df_eng[['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']].tail(10).values
-                sequence_scaled = scaler_X.transform(sequence_data.reshape(-1, 6)).reshape(1, 10, 6)
-                pred_scaled = model.predict(sequence_scaled, verbose=0)
-                pred = scaler_y.inverse_transform(pred_scaled)[0]
-                model_preds = {target: pred[i] for i, target in enumerate(selected_targets)}
                 predictions_data.append(model_preds)
-        
-        # Display predictions
-        pred_df = pd.DataFrame(predictions_data, index=list(all_models.keys()))
-        st.dataframe(pred_df.style.format("{:.4f}"))
-    
-    # Feature importance for tree-based models
-    if 'RF' in all_models or 'XGB' in all_models:
-        st.header("🎯 Feature Importance")
-        
-        model_for_importance = st.selectbox(
-            "Select model for feature importance:",
-            [key for key in ['RF', 'XGB'] if key in all_models]
-        )
-        
-        if model_for_importance:
-            target_for_importance = st.selectbox("Select target:", selected_targets)
+                model_names.append(model_key)
             
-            if model_for_importance == 'RF':
-                importances = all_models['RF'][target_for_importance].feature_importances_
-            else:
-                importances = all_models['XGB'][target_for_importance].feature_importances_
-            
-            feature_importance_df = pd.DataFrame({
-                'feature': feature_cols,
-                'importance': importances
-            }).sort_values('importance', ascending=True)
-            
-            fig = go.Figure(go.Bar(
-                x=feature_importance_df['importance'],
-                y=feature_importance_df['feature'],
-                orientation='h'
-            ))
-            
-            fig.update_layout(
-                title=f"Feature Importance for {target_for_importance} ({model_for_importance})",
-                xaxis_title="Importance",
-                yaxis_title="Features"
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
+            # Display predictions
+            if predictions_data:
+                pred_df = pd.DataFrame(predictions_data, index=model_names)
+                st.dataframe(pred_df.style.format("{:.4f}"))
+                
+        except Exception as e:
+            st.error(f"Error making predictions: {str(e)}")
 
 if __name__ == "__main__":
     main()
